@@ -286,7 +286,7 @@ function parseSheet(rows) {
     const obj = {};
     headers.forEach((h, idx) => {
       const raw = (row[idx] || '').toString().trim();
-      const num = parseFloat(raw.replace(',','.').replace(/[R$\s%]/g,''));
+      const num = parseFloat(raw.replace('R$','').replace('%','').replace(/\s/g,'').replace(',','.'));
       obj[h.trim()] = isNaN(num) ? raw : num;
     });
     result.push(obj);
@@ -380,21 +380,28 @@ function parseRows(rows, cols) {
   if (!rows || rows.length === 0) return [];
   const result = [];
   for (const row of rows) {
-    if (!row || row.every(v => !v)) continue;
+    if (!row || row.every(function(v){return !v;})) continue;
     const obj = {};
-    cols.forEach((col, i) => {
+    cols.forEach(function(col, i) {
       const raw = (row[i] || '').toString().trim();
-      // Remover R$, espaços, trocar vírgula decimal por ponto, remover pontos de milhar
-      const clean = raw
-        .replace(/R\$\s*/g,'')
-        .replace(/\s/g,'')
-        .replace(/\.(?=\d{3}[,\d])/g,'')  // remove ponto de milhar: 1.234,56 -> 1234,56
-        .replace(',','.')                   // troca vírgula decimal: 1234,56 -> 1234.56
-        .replace(/%/g,'')
-        .replace(/#N\/A|#DIV\/0!/g,'0');
+      const hasPercent = raw.indexOf('%') >= 0;
+      const hasCurrency = raw.indexOf('R$') >= 0;
+      // Limpar: remover R$, espacos, #N/A, #DIV/0!
+      let clean = raw;
+      clean = clean.replace('R$','').replace('R$ ','');
+      clean = clean.replace('#N/A','0').replace('#DIV/0!','0');
+      clean = clean.replace('%','').trim();
+      // Remover espacos internos
+      while (clean.indexOf(' ') >= 0) clean = clean.replace(' ','');
+      // Tratar numero brasileiro: 3.014.359,81 -> 3014359.81
+      // Se tem virgula, o ponto eh separador de milhar
+      if (clean.indexOf(',') >= 0) {
+        // Remover pontos (milhar) e trocar virgula por ponto
+        while (clean.indexOf('.') >= 0) clean = clean.replace('.','');
+        clean = clean.replace(',','.');
+      }
       const num = parseFloat(clean);
-      // Para % que vieram como 3,86% -> após limpeza = 3.86 -> dividir por 100
-      if (!isNaN(num) && raw.includes('%') && !raw.includes('R$')) {
+      if (!isNaN(num) && hasPercent && !hasCurrency) {
         obj[col] = num / 100;
       } else {
         obj[col] = isNaN(num) ? raw : num;
