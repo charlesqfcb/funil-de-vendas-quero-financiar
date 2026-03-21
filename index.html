@@ -231,6 +231,7 @@ body{background:var(--bg);color:var(--tx);font-family:'DM Sans',sans-serif;font-
         <div class="pn"><div class="ph"><div><div class="pt">Taxa de Efetivação por Parceiro</div><div class="ps">contratos / aprovados · mensal</div></div></div><div class="pb"><div style="height:205px"><canvas id="c-ef-efet"></canvas></div></div></div>
         <div class="pn"><div class="ph"><div><div class="pt">Custo por Aprovado — Mensal Geral</div><div class="ps">média de todos os parceiros</div></div></div><div class="pb"><div style="height:205px"><canvas id="c-ef-cst-aprov"></canvas></div></div></div>
       </div>
+      <div class="pn g1"><div class="ph"><div><div class="pt">Taxa de Efetivação Geral</div><div class="ps">total contratos ÷ total aprovados · todos os parceiros · mensal</div></div></div><div class="pb"><div style="height:195px"><canvas id="c-ef-efet-geral"></canvas></div></div></div>
     </div>
 
     <!-- IA -->
@@ -801,7 +802,16 @@ function renderAprov() {
 
   const tApv=sum(aprov,'Aprovados'), tCtr=sum(prod,'Contratos_Qtd');
   const avgTx=avg(aprov,'Tx_Aprovacao');
-  const avgCst=avg(aprov,'Cst_Aprovado');
+  const totalApvAll=sum(aprov,'Aprovados');
+  const investMktAll=aprov.length>0?(+aprov[0].Invest_Mkt||0):0;
+  // Usar Invest_Mkt do primeiro registro do mês mais recente
+  const mesesAprov=[...new Set(aprov.map(d=>d.Ano+'-'+String(d.Mes).padStart(2,'0')))].sort();
+  const ultimoMes=mesesAprov[mesesAprov.length-1];
+  const [uA,uM]=ultimoMes?ultimoMes.split('-'):['0','0'];
+  const rowsUltMes=aprov.filter(d=>+d.Ano===+uA&&+d.Mes===+uM);
+  const investUlt=rowsUltMes.length>0?(+rowsUltMes[0].Invest_Mkt||0):0;
+  const apvUlt=rowsUltMes.reduce((s,r)=>s+(+r.Aprovados||0),0);
+  const avgCst=apvUlt>0?investUlt/apvUlt:0;
   const parcs=[...new Set(aprov.map(d=>d.Parceiro))].filter(p=>p&&p!=='(vazio)').sort();
 
   kpi('kpi-aprov',[
@@ -824,17 +834,46 @@ function renderAprov() {
   mkC('c-ap-qtd',{type:'bar',data:{labels:labs,datasets:parcs.map(p=>({label:p,data:qtdP[p],backgroundColor:CORES[p]+'66',borderColor:CORES[p],borderWidth:1,borderRadius:2,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT}},scales:{x:{stacked:true,grid:{display:false},ticks:{maxRotation:0}},y:{stacked:true,grid:GR}}}});
 
   // Custo por aprovado por parceiro
-  mkC('c-ap-cst',{type:'line',data:{labels:labs,datasets:parcs.map(p=>({label:p,data:cstP[p],borderColor:CORES[p],backgroundColor:'transparent',borderWidth:1.5,pointRadius:2,tension:.3,spanGaps:true}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT,callbacks:{label:c=>c.parsed.y!=null?` ${c.dataset.label}: R$ ${c.parsed.y.toFixed(0)}`:''}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>'R$'+v.toFixed(0)}}}}});
+  // Calcular Cst/Aprovado corretamente: Invest_Mkt_mes ÷ Aprovados_parceiro
+  // Invest_Mkt é o mesmo para todos os parceiros no mesmo mês
+  const cstCalcP = {};
+  parcs.forEach(p => {
+    cstCalcP[p] = ps.map(pair => {
+      const [a,m] = pair.split('-');
+      const rowsP = aprov.filter(d=>+d.Ano===+a&&+d.Mes===+m&&d.Parceiro===p);
+      const apvQtd = rowsP.reduce((s,r)=>s+(+r.Aprovados||0),0);
+      // Pegar invest_mkt do mês (mesmo valor para todos parceiros)
+      const allRows = aprov.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+      const investMkt = allRows.length>0 ? (+allRows[0].Invest_Mkt||0) : 0;
+      return apvQtd>0 ? investMkt/apvQtd : null;
+    });
+  });
+  mkC('c-ap-cst',{type:'line',data:{labels:labs,datasets:parcs.map(p=>({label:p,data:cstCalcP[p],borderColor:CORES[p],backgroundColor:'transparent',borderWidth:1.5,pointRadius:2,tension:.3,spanGaps:true}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT,callbacks:{label:c=>c.parsed.y!=null?` ${c.dataset.label}: R$ ${c.parsed.y.toFixed(2).replace('.',',')}`:''}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>'R$'+v.toFixed(0)}}}}});
 
   // Custo Aprovado vs Aprovado + Ativas (BV)
+  // Fórmula: Invest_Mkt ÷ Aprovados | Invest_Mkt ÷ (Aprovados + Ativas_Rec)
   const bv=aprov.filter(d=>d.Parceiro==='Banco BV');
   const psBV=pairs(bv), labsBV=psBV.map(pLab);
-  const cstApvBV=byMth(bv,'Cst_Aprovado','avg');
-  const cstAtivasBV=byMth(bv,'Cst_Aprov_Ativas','avg');
+  const cstApvBV=psBV.map(pair=>{
+    const [a,m]=pair.split('-');
+    const rows=bv.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+    const apvQtd=rows.reduce((s,r)=>s+(+r.Aprovados||0),0);
+    const invest=rows.length>0?(+rows[0].Invest_Mkt||0):0;
+    return apvQtd>0?invest/apvQtd:null;
+  });
+  const cstAtivasBV=psBV.map(pair=>{
+    const [a,m]=pair.split('-');
+    const rows=bv.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+    const apvQtd=rows.reduce((s,r)=>s+(+r.Aprovados||0),0);
+    const ativasQtd=rows.reduce((s,r)=>s+(+r.Ativas_Rec||0),0);
+    const invest=rows.length>0?(+rows[0].Invest_Mkt||0):0;
+    const total=apvQtd+ativasQtd;
+    return total>0?invest/total:null;
+  });
   mkC('c-ap-ativas',{type:'bar',data:{labels:labsBV,datasets:[
     {label:'Cst Aprovado (BV)',data:cstApvBV,backgroundColor:'rgba(0,200,120,.55)',borderColor:'#00c878',borderWidth:1,borderRadius:2,borderSkipped:false},
     {label:'Cst Aprov + Ativas',data:cstAtivasBV,backgroundColor:'rgba(255,107,53,.55)',borderColor:'#ff6b35',borderWidth:1,borderRadius:2,borderSkipped:false},
-  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT,callbacks:{label:c=>` ${c.dataset.label}: R$ ${c.parsed.y!=null?c.parsed.y.toFixed(2):0}`}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>'R$'+v.toFixed(0)}}}}});
+  ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT,callbacks:{label:c=>` ${c.dataset.label}: R$ ${c.parsed.y!=null?c.parsed.y.toFixed(2).replace('.',','):0}`}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>'R$'+v.toFixed(0)}}}}});
 
   // Tabela
   document.getElementById('tbl-aprov').innerHTML=
@@ -875,9 +914,37 @@ function renderEfi() {
   });
   mkC('c-ef-efet',{type:'bar',data:{labels:labs,datasets:efetDatasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{boxWidth:7,padding:10,font:{size:9}}},tooltip:{...TT,callbacks:{label:c=>c.parsed.y!=null?` ${c.dataset.label}: ${c.parsed.y.toFixed(1)}%`:''}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>v+'%'}}}}});
 
-  // Custo médio por aprovado geral mensal
-  const cstGeral=byMth(aprov,'Cst_Aprovado','avg');
+  // Custo médio por aprovado geral mensal: Invest_Mkt ÷ Total Aprovados do mês
+  const cstGeral = ps.map(pair => {
+    const [a,m] = pair.split('-');
+    const rows = aprov.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+    const totalApv = rows.reduce((s,r)=>s+(+r.Aprovados||0),0);
+    const investMkt = rows.length>0 ? (+rows[0].Invest_Mkt||0) : 0;
+    return totalApv>0 ? investMkt/totalApv : null;
+  });
   mkC('c-ef-cst-aprov',{type:'bar',data:{labels:labs,datasets:[{label:'Custo/Aprovado',data:cstGeral,backgroundColor:cstGeral.map(v=>v&&v>400?'rgba(255,107,53,.6)':v&&v>250?'rgba(245,200,66,.6)':'rgba(0,200,120,.6)'),borderRadius:3,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{...TT,callbacks:{label:c=>` R$ ${c.parsed.y!=null?c.parsed.y.toFixed(2).replace('.',','):0}`}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>'R$'+v.toFixed(0)}}}}});
+
+  // Taxa de Efetivação Geral: total contratos / total aprovados por mês
+  const efetGeral = ps.map(pair => {
+    const [a,m] = pair.split('-');
+    const apvRows = aprov.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+    const prodRows = prod.filter(d=>+d.Ano===+a&&+d.Mes===+m);
+    const totalApv = apvRows.reduce((s,r)=>s+(+r.Aprovados||0),0);
+    const totalCtr = prodRows.reduce((s,r)=>s+(+r.Contratos_Qtd||0),0);
+    return totalApv>0 ? +(totalCtr/totalApv*100).toFixed(2) : null;
+  });
+  mkC('c-ef-efet-geral',{type:'line',data:{labels:labs,datasets:[{
+    label:'Tx Efetivação Geral',
+    data:efetGeral,
+    borderColor:'#00c878',
+    backgroundColor:grd('c-ef-efet-geral','#00c878',195),
+    borderWidth:2.5,
+    pointRadius:4,
+    pointBackgroundColor:'#00c878',
+    tension:.4,
+    fill:true,
+    spanGaps:true,
+  }]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{...TT,callbacks:{label:c=>c.parsed.y!=null?` Efetivação: ${c.parsed.y.toFixed(1)}%`:''}}},scales:{x:{grid:{display:false},ticks:{maxRotation:0}},y:{grid:GR,ticks:{callback:v=>v.toFixed(0)+'%'}}}}});
 }
 
 // ── AI ─────────────────────────────────────────────────────────────────────
