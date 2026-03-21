@@ -251,7 +251,7 @@ body{background:var(--bg);color:var(--tx);font-family:'DM Sans',sans-serif;font-
 <script>
 // ── CONFIG ──────────────────────────────────────────────────────────────
 const API_KEY  = 'AIzaSyBAO2m2IoY_JZN0lIppMrOGxSGPgRibSSM';
-const SHEET_ID = '158zKB4ie-rbAy2UWSt4yrzwxBt7sIFdH';
+const SHEET_ID = '1SgRTO9C6cKnlgpJCZtmWEqNmDAiyPlOs6A7kYV2vsRw';
 const BASE_URL = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values`;
 
 const MESES = ['','Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
@@ -333,35 +333,41 @@ async function tryGoogleSheets() {
 async function loadFullFromSheets() {
   setStatus('ld', 'atualizando...');
   try {
+    // Ranges exatos baseados no diagnóstico:
+    // Produção: header linha 10 (índice 9), dados a partir linha 11
+    // Marketing: header linha 7 (índice 6), dados a partir linha 8
+    // Aprovações: header linha 5 (índice 4), dados a partir linha 6
+    // Originação: header linha 5 (índice 4), dados a partir linha 6
     const [pRaw, aRaw, oRaw, mRaw] = await Promise.all([
-      fetchSheet('Produção e Comissões', 'A11:S400'),
-      fetchSheet('Aprovações', 'A5:R500'),
-      fetchSheet('Originação', 'A6:J300'),
-      fetchSheet('Marketing', 'A8:I5000'),
+      fetchSheet('Produção e Comissões', 'B11:T2000'),
+      fetchSheet('Aprovações',           'B6:S4000'),
+      fetchSheet('Originação',           'B6:J2000'),
+      fetchSheet('Marketing',            'B8:I5000'),
     ]);
-    
-    // Parsear cada aba
-    const prodParsed  = parseSheetData(pRaw,  ['Data','Dias_Uteis','Dias_Corridos','Parceiro','Comissao','Contratos_Qtd','Contratos_R','RunRate_Prod','Receita_Bruta','Share_Receita','RunRate_Rec','Ticket_Medio','Cst_Mensal_Mkt','Mes','Ano','Custo_Mkt_Mes','Cst_Pago_Parceiro','Cst_Geral_Pago']);
-    const aprovParsed = parseSheetData(aRaw,  ['Data','Parceiro','PDEC3','Aprovados','Ativas_Rec','Pos_PDEC','Por_Cliente','Cst_PDEC3','Cst_Aprovado','Cst_Aprov_Ativas','Invest_Mkt','Clientes_Mes','Mes','Ano','Qtd_Aprov_Parceiro','Tx_Aprovacao','Soma_Aprov_Mes']);
-    const origParsed  = parseSheetData(oRaw,  ['Data','Clientes','Leads','Total','Tx_Conv','Mes','Ano','Clientes_Aprov_Mes','Custo_Orig']);
-    const mktParsed   = parseSheetData(mRaw,  ['Data','Midia','Custo','Tributo_Pct','Custo_Tributos','Obs','Mes','Ano']);
 
-    if (prodParsed.length > 0) {
-      DB.prod  = prodParsed.filter(r => r.Mes > 0 && r.Ano > 0 && r.Parceiro);
-      DB.aprov = aprovParsed.filter(r => r.Mes > 0 && r.Ano > 0);
-      DB.orig  = origParsed.filter(r => r.Mes > 0 && r.Ano > 0);
-      DB.mkt   = mktParsed.filter(r => r.Mes > 0 && r.Ano > 0 && r.Custo > 0);
-      
-      // Reagregar originação e marketing por mês
-      DB.orig  = agruparOrig(DB.orig);
-      DB.mkt   = agruparMkt(DB.mkt);
-      DB.aprov = agruparAprov(DB.aprov);
-      
+    const prodParsed  = parseRows(pRaw,  ['Data','Dias_Uteis','Dias_Corridos','Parceiro','Comissao','Contratos_Qtd','Contratos_R','RunRate_Prod','Receita_Bruta','Share_Receita','RunRate_Rec','Ticket_Medio','Cst_Mensal_Mkt','Mes','Ano','Custo_Mkt_Mes','Cst_Pago_Parceiro','Cst_Geral_Pago']);
+    const aprovParsed = parseRows(aRaw,  ['Data','Parceiro','PDEC3','Aprovados','Ativas_Rec','Pos_PDEC','Por_Cliente','Cst_PDEC3','Cst_Aprovado','Cst_Aprov_Ativas','Invest_Mkt','Clientes_Mes','Mes','Ano','Qtd_Aprov_Parceiro','Tx_Aprovacao','Soma_Aprov_Mes']);
+    const origParsed  = parseRows(oRaw,  ['Data','Clientes','Leads','Total','Tx_Conv','Mes','Ano','Clientes_Aprov_Mes','Custo_Orig']);
+    const mktParsed   = parseRows(mRaw,  ['Data','Midia','Custo','Tributo_Pct','Custo_Tributos','Obs','Mes','Ano']);
+
+    const prod  = prodParsed.filter(r  => r.Mes > 0 && r.Ano > 2000 && r.Parceiro && r.Parceiro.length > 2);
+    const aprov = aprovParsed.filter(r => r.Mes > 0 && r.Ano > 2000 && r.Parceiro && r.Parceiro.length > 2);
+    const orig  = origParsed.filter(r  => r.Mes > 0 && r.Ano > 2000 && r.Clientes > 0);
+    const mkt   = mktParsed.filter(r   => r.Mes > 0 && r.Ano > 2000 && r.Custo > 0 && r.Midia);
+
+    console.log('Sheets parsed — prod:', prod.length, 'aprov:', aprov.length, 'orig:', orig.length, 'mkt:', mkt.length);
+
+    if (prod.length > 0) {
+      DB.prod  = prod;
+      DB.aprov = agruparAprov(aprov);
+      DB.orig  = agruparOrig(orig);
+      DB.mkt   = agruparMkt(mkt);
       setStatus('ok', new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) + ' · live ✓');
       document.getElementById('sd').className = 'sd';
       initFilters();
       renderPage(ACTIVE);
     } else {
+      console.warn('Nenhum dado de produção encontrado — usando cache');
       setStatus('ok', 'dados locais');
     }
   } catch(e) {
@@ -370,16 +376,29 @@ async function loadFullFromSheets() {
   }
 }
 
-function parseSheetData(rows, cols) {
+function parseRows(rows, cols) {
   if (!rows || rows.length === 0) return [];
   const result = [];
   for (const row of rows) {
-    if (!row || row.length === 0) continue;
+    if (!row || row.every(v => !v)) continue;
     const obj = {};
     cols.forEach((col, i) => {
       const raw = (row[i] || '').toString().trim();
-      const num = parseFloat(raw.replace(',','.').replace(/[^\d.-]/g,''));
-      obj[col] = isNaN(num) ? raw : num;
+      // Remover R$, espaços, trocar vírgula decimal por ponto, remover pontos de milhar
+      const clean = raw
+        .replace(/R\$\s*/g,'')
+        .replace(/\s/g,'')
+        .replace(/\.(?=\d{3}[,\d])/g,'')  // remove ponto de milhar: 1.234,56 -> 1234,56
+        .replace(',','.')                   // troca vírgula decimal: 1234,56 -> 1234.56
+        .replace(/%/g,'')
+        .replace(/#N\/A|#DIV\/0!/g,'0');
+      const num = parseFloat(clean);
+      // Para % que vieram como 3,86% -> após limpeza = 3.86 -> dividir por 100
+      if (!isNaN(num) && raw.includes('%') && !raw.includes('R$')) {
+        obj[col] = num / 100;
+      } else {
+        obj[col] = isNaN(num) ? raw : num;
+      }
     });
     result.push(obj);
   }
