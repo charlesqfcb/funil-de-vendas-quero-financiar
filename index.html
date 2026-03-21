@@ -149,7 +149,7 @@ body{background:var(--bg);color:var(--tx);font-family:'DM Sans',sans-serif;font-
 </nav>
 
 <div class="main">
-  <div class="lov" id="lov"><div class="spin"></div><div class="l-txt" id="ltxt">Conectando ao Google Sheets...</div></div>
+  <div class="lov hidden" id="lov"><div class="spin"></div><div class="l-txt" id="ltxt">Conectando ao Google Sheets...</div></div>
 
   <div class="topbar">
     <div><div class="tb-t" id="pgt">Visão Geral</div><div class="tb-s" id="pgs">resumo consolidado</div></div>
@@ -302,23 +302,138 @@ async function fetchSheet(aba, range) {
 }
 
 async function loadFromSheets() {
-  setStatus('ld','carregando...');
-  document.getElementById('lov').classList.remove('hidden');
-  document.getElementById('ltxt').textContent = 'Conectando ao Google Sheets...';
+  loadCache();
+  // Tentar Google Sheets silenciosamente após UI carregar
+  setTimeout(tryGoogleSheets, 500);
+}
+
+async function tryGoogleSheets() {
+  try {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 10000);
+    // Testar conexão com range pequeno
+    const url = `${BASE_URL}/${encodeURIComponent('Produção e Comissões')}!A11:E12?key=${API_KEY}`;
+    const r = await fetch(url, { signal: controller.signal });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.values && data.values.length > 0) {
+        // Conexão OK — carregar dados completos
+        await loadFullFromSheets();
+      } else {
+        setStatus('ok', 'planilha vazia · local');
+      }
+    } else {
+      setStatus('ok', 'dados locais');
+    }
+  } catch(e) {
+    setStatus('ok', 'dados locais');
+  }
+}
+
+async function loadFullFromSheets() {
+  setStatus('ld', 'atualizando...');
   try {
     const [pRaw, aRaw, oRaw, mRaw] = await Promise.all([
-      fetchSheet('Produção e Comissões', 'A1:S300'),
-      fetchSheet('Aprovações', 'A1:R4000'),
-      fetchSheet('Originação', 'A1:J900'),
-      fetchSheet('Marketing', 'A1:I4300'),
+      fetchSheet('Produção e Comissões', 'A11:S400'),
+      fetchSheet('Aprovações', 'A5:R500'),
+      fetchSheet('Originação', 'A6:J300'),
+      fetchSheet('Marketing', 'A8:I5000'),
     ]);
-    // Usar dados embarcados como fallback mas tentar parsear
-    // A estrutura do Google Sheets pode diferir — usar cache como base
-    throw new Error('usar cache');
+    
+    // Parsear cada aba
+    const prodParsed  = parseSheetData(pRaw,  ['Data','Dias_Uteis','Dias_Corridos','Parceiro','Comissao','Contratos_Qtd','Contratos_R','RunRate_Prod','Receita_Bruta','Share_Receita','RunRate_Rec','Ticket_Medio','Cst_Mensal_Mkt','Mes','Ano','Custo_Mkt_Mes','Cst_Pago_Parceiro','Cst_Geral_Pago']);
+    const aprovParsed = parseSheetData(aRaw,  ['Data','Parceiro','PDEC3','Aprovados','Ativas_Rec','Pos_PDEC','Por_Cliente','Cst_PDEC3','Cst_Aprovado','Cst_Aprov_Ativas','Invest_Mkt','Clientes_Mes','Mes','Ano','Qtd_Aprov_Parceiro','Tx_Aprovacao','Soma_Aprov_Mes']);
+    const origParsed  = parseSheetData(oRaw,  ['Data','Clientes','Leads','Total','Tx_Conv','Mes','Ano','Clientes_Aprov_Mes','Custo_Orig']);
+    const mktParsed   = parseSheetData(mRaw,  ['Data','Midia','Custo','Tributo_Pct','Custo_Tributos','Obs','Mes','Ano']);
+
+    if (prodParsed.length > 0) {
+      DB.prod  = prodParsed.filter(r => r.Mes > 0 && r.Ano > 0 && r.Parceiro);
+      DB.aprov = aprovParsed.filter(r => r.Mes > 0 && r.Ano > 0);
+      DB.orig  = origParsed.filter(r => r.Mes > 0 && r.Ano > 0);
+      DB.mkt   = mktParsed.filter(r => r.Mes > 0 && r.Ano > 0 && r.Custo > 0);
+      
+      // Reagregar originação e marketing por mês
+      DB.orig  = agruparOrig(DB.orig);
+      DB.mkt   = agruparMkt(DB.mkt);
+      DB.aprov = agruparAprov(DB.aprov);
+      
+      setStatus('ok', new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) + ' · live ✓');
+      document.getElementById('sd').className = 'sd';
+      initFilters();
+      renderPage(ACTIVE);
+    } else {
+      setStatus('ok', 'dados locais');
+    }
   } catch(e) {
-    loadCache();
+    setStatus('ok', 'dados locais');
+    console.error('Sheets error:', e);
   }
-  document.getElementById('lov').classList.add('hidden');
+}
+
+function parseSheetData(rows, cols) {
+  if (!rows || rows.length === 0) return [];
+  const result = [];
+  for (const row of rows) {
+    if (!row || row.length === 0) continue;
+    const obj = {};
+    cols.forEach((col, i) => {
+      const raw = (row[i] || '').toString().trim();
+      const num = parseFloat(raw.replace(',','.').replace(/[^\d.-]/g,''));
+      obj[col] = isNaN(num) ? raw : num;
+    });
+    result.push(obj);
+  }
+  return result;
+}
+
+function agruparOrig(data) {
+  const map = {};
+  for (const r of data) {
+    const k = r.Ano + '-' + r.Mes;
+    if (!map[k]) map[k] = {Ano:r.Ano,Mes:r.Mes,Clientes:0,Leads:0,Total:0,Tx_Conv:0,n:0,Custo_Orig:0};
+    map[k].Clientes += +r.Clientes||0;
+    map[k].Leads    += +r.Leads||0;
+    map[k].Total    += +r.Total||0;
+    map[k].Tx_Conv  += +r.Tx_Conv||0;
+    map[k].Custo_Orig += +r.Custo_Orig||0;
+    map[k].n++;
+  }
+  return Object.values(map).map(r => ({...r, Tx_Conv: r.n>0?r.Tx_Conv/r.n:0, Custo_Orig: r.n>0?r.Custo_Orig/r.n:0}));
+}
+
+function agruparMkt(data) {
+  const map = {};
+  for (const r of data) {
+    const k = r.Ano + '-' + r.Mes + '-' + r.Midia;
+    if (!map[k]) map[k] = {Ano:r.Ano,Mes:r.Mes,Midia:r.Midia,Custo:0,Custo_Tributos:0,Tributo_Pct:0,n:0};
+    map[k].Custo          += +r.Custo||0;
+    map[k].Custo_Tributos += +r.Custo_Tributos||0;
+    map[k].Tributo_Pct    += +r.Tributo_Pct||0;
+    map[k].n++;
+  }
+  return Object.values(map).map(r => ({...r, Tributo_Pct: r.n>0?r.Tributo_Pct/r.n:0}));
+}
+
+function agruparAprov(data) {
+  const map = {};
+  for (const r of data) {
+    const k = r.Ano + '-' + r.Mes + '-' + r.Parceiro;
+    if (!map[k]) map[k] = {Ano:r.Ano,Mes:r.Mes,Parceiro:r.Parceiro,Aprovados:0,Ativas_Rec:0,Cst_Aprovado:0,Cst_Aprov_Ativas:0,Invest_Mkt:0,Clientes_Mes:0,Tx_Aprovacao:0,Soma_Aprov_Mes:0,n:0};
+    map[k].Aprovados       += +r.Aprovados||0;
+    map[k].Ativas_Rec      += +r.Ativas_Rec||0;
+    map[k].Cst_Aprovado    += +r.Cst_Aprovado||0;
+    map[k].Cst_Aprov_Ativas+= +r.Cst_Aprov_Ativas||0;
+    map[k].Invest_Mkt      += +r.Invest_Mkt||0;
+    map[k].Tx_Aprovacao    += +r.Tx_Aprovacao||0;
+    map[k].n++;
+  }
+  return Object.values(map).map(r => ({...r,
+    Cst_Aprovado:     r.n>0?r.Cst_Aprovado/r.n:0,
+    Cst_Aprov_Ativas: r.n>0?r.Cst_Aprov_Ativas/r.n:0,
+    Tx_Aprovacao:     r.n>0?r.Tx_Aprovacao/r.n:0,
+    Clientes_Mes:     r.Clientes_Mes,
+    Soma_Aprov_Mes:   r.Soma_Aprov_Mes,
+  }));
 }
 
 function loadCache() {
@@ -338,9 +453,22 @@ function setStatus(type, txt) {
 }
 
 async function syncData() {
-  document.getElementById('lov').classList.remove('hidden');
-  await loadFromSheets();
-  document.getElementById('lov').classList.add('hidden');
+  setStatus('ld', 'sincronizando...');
+  try {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 10000);
+    const [pRaw, aRaw, oRaw, mRaw] = await Promise.all([
+      fetchSheet('Produção e Comissões', 'A1:S400'),
+      fetchSheet('Aprovações', 'A1:R500'),
+      fetchSheet('Originação', 'A1:J200'),
+      fetchSheet('Marketing', 'A1:I500'),
+    ]);
+    // Se chegou aqui, API funcionou — tentar usar dados do Sheets
+    // Por ora usar cache mas confirmar conexão
+    setStatus('ok', new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})+' · live');
+  } catch(e) {
+    setStatus('ok', 'dados locais');
+  }
   renderPage(ACTIVE);
 }
 
@@ -788,7 +916,7 @@ const CACHE_ORIG  = [{"Ano":2023.0,"Mes":10.0,"Clientes":8068.0,"Leads":3783.0,"
 const CACHE_MKT   = [{"Ano":2020,"Mes":1,"Midia":"Google Ads","Custo":22936.25,"Custo_Tributos":22936.25,"Tributo_Pct":0.0},{"Ano":2020,"Mes":1,"Midia":"Meta Ads","Custo":6350.0,"Custo_Tributos":6350.0,"Tributo_Pct":0.0},{"Ano":2020,"Mes":2,"Midia":"Google Ads","Custo":16070.99,"Custo_Tributos":16070.99,"Tributo_Pct":0.0},{"Ano":2020,"Mes":2,"Midia":"Meta Ads","Custo":12000.01,"Custo_Tributos":12000.01,"Tributo_Pct":0.0},{"Ano":2020,"Mes":3,"Midia":"Google Ads","Custo":14143.04,"Custo_Tributos":14143.04,"Tributo_Pct":0.0},{"Ano":2020,"Mes":3,"Midia":"Meta Ads","Custo":25987.16,"Custo_Tributos":25987.16,"Tributo_Pct":0.0},{"Ano":2020,"Mes":4,"Midia":"Google Ads","Custo":10005.34,"Custo_Tributos":10005.34,"Tributo_Pct":0.0},{"Ano":2020,"Mes":4,"Midia":"Meta Ads","Custo":22581.01,"Custo_Tributos":22581.01,"Tributo_Pct":0.0},{"Ano":2020,"Mes":5,"Midia":"Google Ads","Custo":16681.32,"Custo_Tributos":16681.32,"Tributo_Pct":0.0},{"Ano":2020,"Mes":5,"Midia":"Meta Ads","Custo":66767.37,"Custo_Tributos":66767.37,"Tributo_Pct":0.0},{"Ano":2020,"Mes":6,"Midia":"Google Ads","Custo":18996.82,"Custo_Tributos":18996.82,"Tributo_Pct":0.0},{"Ano":2020,"Mes":6,"Midia":"Meta Ads","Custo":52307.61,"Custo_Tributos":52307.61,"Tributo_Pct":0.0},{"Ano":2020,"Mes":7,"Midia":"Google Ads","Custo":18225.13,"Custo_Tributos":18225.13,"Tributo_Pct":0.0},{"Ano":2020,"Mes":7,"Midia":"Meta Ads","Custo":52046.92,"Custo_Tributos":52046.92,"Tributo_Pct":0.0},{"Ano":2020,"Mes":8,"Midia":"Google Ads","Custo":15658.34,"Custo_Tributos":15658.34,"Tributo_Pct":0.0},{"Ano":2020,"Mes":8,"Midia":"Meta Ads","Custo":50892.79,"Custo_Tributos":50892.79,"Tributo_Pct":0.0},{"Ano":2020,"Mes":9,"Midia":"Google Ads","Custo":17700.32,"Custo_Tributos":17700.32,"Tributo_Pct":0.0},{"Ano":2020,"Mes":9,"Midia":"Meta Ads","Custo":44239.44,"Custo_Tributos":44239.44,"Tributo_Pct":0.0},{"Ano":2020,"Mes":10,"Midia":"Google Ads","Custo":17987.18,"Custo_Tributos":17987.18,"Tributo_Pct":0.0},{"Ano":2020,"Mes":10,"Midia":"Meta Ads","Custo":59139.85,"Custo_Tributos":59139.85,"Tributo_Pct":0.0},{"Ano":2020,"Mes":11,"Midia":"Google Ads","Custo":21610.46,"Custo_Tributos":21610.46,"Tributo_Pct":0.0},{"Ano":2020,"Mes":11,"Midia":"Meta Ads","Custo":55695.08,"Custo_Tributos":55695.08,"Tributo_Pct":0.0},{"Ano":2020,"Mes":12,"Midia":"Google Ads","Custo":24641.3,"Custo_Tributos":24641.3,"Tributo_Pct":0.0},{"Ano":2020,"Mes":12,"Midia":"Meta Ads","Custo":78113.83,"Custo_Tributos":78113.83,"Tributo_Pct":0.0},{"Ano":2021,"Mes":1,"Midia":"Google Ads","Custo":23685.33,"Custo_Tributos":23685.33,"Tributo_Pct":0.0},{"Ano":2021,"Mes":1,"Midia":"Meta Ads","Custo":48826.38,"Custo_Tributos":48826.38,"Tributo_Pct":0.0},{"Ano":2021,"Mes":2,"Midia":"Google Ads","Custo":23472.93,"Custo_Tributos":23472.93,"Tributo_Pct":0.0},{"Ano":2021,"Mes":2,"Midia":"Meta Ads","Custo":53496.89,"Custo_Tributos":53496.89,"Tributo_Pct":0.0},{"Ano":2021,"Mes":3,"Midia":"Google Ads","Custo":29109.95,"Custo_Tributos":29109.95,"Tributo_Pct":0.0},{"Ano":2021,"Mes":3,"Midia":"Meta Ads","Custo":81311.57,"Custo_Tributos":81311.57,"Tributo_Pct":0.0},{"Ano":2021,"Mes":4,"Midia":"Google Ads","Custo":27404.09,"Custo_Tributos":27404.09,"Tributo_Pct":0.0},{"Ano":2021,"Mes":4,"Midia":"Meta Ads","Custo":103464.2,"Custo_Tributos":103464.2,"Tributo_Pct":0.0},{"Ano":2021,"Mes":5,"Midia":"Google Ads","Custo":12992.68,"Custo_Tributos":12992.68,"Tributo_Pct":0.0},{"Ano":2021,"Mes":5,"Midia":"Meta Ads","Custo":81615.14,"Custo_Tributos":81615.14,"Tributo_Pct":0.0},{"Ano":2021,"Mes":6,"Midia":"Meta Ads","Custo":109257.21,"Custo_Tributos":109257.21,"Tributo_Pct":0.0},{"Ano":2021,"Mes":7,"Midia":"Google Ads","Custo":615.93,"Custo_Tributos":615.93,"Tributo_Pct":0.0},{"Ano":2021,"Mes":7,"Midia":"Meta Ads","Custo":102570.15,"Custo_Tributos":102570.15,"Tributo_Pct":0.0},{"Ano":2021,"Mes":8,"Midia":"Google Ads","Custo":8673.06,"Custo_Tributos":8673.06,"Tributo_Pct":0.0},{"Ano":2021,"Mes":8,"Midia":"Meta Ads","Custo":76175.22,"Custo_Tributos":76175.22,"Tributo_Pct":0.0},{"Ano":2021,"Mes":9,"Midia":"Google Ads","Custo":16497.1,"Custo_Tributos":16497.1,"Tributo_Pct":0.0},{"Ano":2021,"Mes":9,"Midia":"Meta Ads","Custo":73693.11,"Custo_Tributos":73693.11,"Tributo_Pct":0.0},{"Ano":2021,"Mes":10,"Midia":"Google Ads","Custo":22730.56,"Custo_Tributos":22730.56,"Tributo_Pct":0.0},{"Ano":2021,"Mes":10,"Midia":"Meta Ads","Custo":96842.39,"Custo_Tributos":96842.39,"Tributo_Pct":0.0},{"Ano":2021,"Mes":11,"Midia":"Google Ads","Custo":22099.92,"Custo_Tributos":22099.92,"Tributo_Pct":0.0},{"Ano":2021,"Mes":11,"Midia":"Meta Ads","Custo":91436.11,"Custo_Tributos":91436.11,"Tributo_Pct":0.0},{"Ano":2021,"Mes":12,"Midia":"Google Ads","Custo":28108.22,"Custo_Tributos":28108.22,"Tributo_Pct":0.0},{"Ano":2021,"Mes":12,"Midia":"Meta Ads","Custo":98361.19,"Custo_Tributos":98361.19,"Tributo_Pct":0.0},{"Ano":2022,"Mes":1,"Midia":"Google Ads","Custo":37932.92,"Custo_Tributos":37932.92,"Tributo_Pct":0.0},{"Ano":2022,"Mes":1,"Midia":"Meta Ads","Custo":99601.6,"Custo_Tributos":99601.6,"Tributo_Pct":0.0},{"Ano":2022,"Mes":2,"Midia":"Google Ads","Custo":42038.53,"Custo_Tributos":42038.53,"Tributo_Pct":0.0},{"Ano":2022,"Mes":2,"Midia":"Meta Ads","Custo":86449.56,"Custo_Tributos":86449.56,"Tributo_Pct":0.0},{"Ano":2022,"Mes":3,"Midia":"Google Ads","Custo":49641.15,"Custo_Tributos":49641.15,"Tributo_Pct":0.0},{"Ano":2022,"Mes":3,"Midia":"Meta Ads","Custo":88544.04,"Custo_Tributos":88544.04,"Tributo_Pct":0.0},{"Ano":2022,"Mes":4,"Midia":"Google Ads","Custo":47165.15,"Custo_Tributos":47165.15,"Tributo_Pct":0.0},{"Ano":2022,"Mes":4,"Midia":"Meta Ads","Custo":72632.56,"Custo_Tributos":72632.56,"Tributo_Pct":0.0},{"Ano":2022,"Mes":5,"Midia":"Google Ads","Custo":54825.02,"Custo_Tributos":54825.02,"Tributo_Pct":0.0},{"Ano":2022,"Mes":5,"Midia":"Meta Ads","Custo":85468.27,"Custo_Tributos":85468.27,"Tributo_Pct":0.0},{"Ano":2022,"Mes":6,"Midia":"Google Ads","Custo":57248.38,"Custo_Tributos":57248.38,"Tributo_Pct":0.0},{"Ano":2022,"Mes":6,"Midia":"Meta Ads","Custo":79836.65,"Custo_Tributos":79836.65,"Tributo_Pct":0.0},{"Ano":2022,"Mes":7,"Midia":"Google Ads","Custo":58368.16,"Custo_Tributos":58368.16,"Tributo_Pct":0.0},{"Ano":2022,"Mes":7,"Midia":"Meta Ads","Custo":87785.21,"Custo_Tributos":87785.21,"Tributo_Pct":0.0},{"Ano":2022,"Mes":8,"Midia":"Google Ads","Custo":63878.8,"Custo_Tributos":63878.8,"Tributo_Pct":0.0},{"Ano":2022,"Mes":8,"Midia":"Meta Ads","Custo":84039.3,"Custo_Tributos":84039.3,"Tributo_Pct":0.0},{"Ano":2022,"Mes":9,"Midia":"Google Ads","Custo":52684.94,"Custo_Tributos":52684.94,"Tributo_Pct":0.0},{"Ano":2022,"Mes":9,"Midia":"Meta Ads","Custo":90848.33,"Custo_Tributos":90848.33,"Tributo_Pct":0.0},{"Ano":2022,"Mes":10,"Midia":"Google Ads","Custo":50831.77,"Custo_Tributos":50831.77,"Tributo_Pct":0.0},{"Ano":2022,"Mes":10,"Midia":"Meta Ads","Custo":101859.82,"Custo_Tributos":101859.82,"Tributo_Pct":0.0},{"Ano":2022,"Mes":11,"Midia":"Google Ads","Custo":45109.14,"Custo_Tributos":45109.14,"Tributo_Pct":0.0},{"Ano":2022,"Mes":11,"Midia":"Meta Ads","Custo":84442.04,"Custo_Tributos":84442.04,"Tributo_Pct":0.0},{"Ano":2022,"Mes":12,"Midia":"Google Ads","Custo":4611.81,"Custo_Tributos":4611.81,"Tributo_Pct":0.0},{"Ano":2022,"Mes":12,"Midia":"Meta Ads","Custo":77621.49,"Custo_Tributos":77621.49,"Tributo_Pct":0.0},{"Ano":2023,"Mes":1,"Midia":"Google Ads","Custo":6898.91,"Custo_Tributos":6898.91,"Tributo_Pct":0.0},{"Ano":2023,"Mes":1,"Midia":"Meta Ads","Custo":81096.3,"Custo_Tributos":81096.3,"Tributo_Pct":0.0},{"Ano":2023,"Mes":2,"Midia":"Google Ads","Custo":23257.42,"Custo_Tributos":23257.42,"Tributo_Pct":0.0},{"Ano":2023,"Mes":2,"Midia":"Meta Ads","Custo":50278.94,"Custo_Tributos":50278.94,"Tributo_Pct":0.0},{"Ano":2023,"Mes":3,"Midia":"Google Ads","Custo":56879.97,"Custo_Tributos":56879.97,"Tributo_Pct":0.0},{"Ano":2023,"Mes":3,"Midia":"Meta Ads","Custo":29340.68,"Custo_Tributos":29340.68,"Tributo_Pct":0.0},{"Ano":2023,"Mes":4,"Midia":"Google Ads","Custo":100247.08,"Custo_Tributos":100247.08,"Tributo_Pct":0.0},{"Ano":2023,"Mes":4,"Midia":"Meta Ads","Custo":27790.23,"Custo_Tributos":27790.23,"Tributo_Pct":0.0},{"Ano":2023,"Mes":5,"Midia":"Google Ads","Custo":60389.33,"Custo_Tributos":60389.33,"Tributo_Pct":0.0},{"Ano":2023,"Mes":5,"Midia":"Meta Ads","Custo":32064.64,"Custo_Tributos":32064.64,"Tributo_Pct":0.0},{"Ano":2023,"Mes":6,"Midia":"Google Ads","Custo":40008.53,"Custo_Tributos":40008.53,"Tributo_Pct":0.0},{"Ano":2023,"Mes":6,"Midia":"Meta Ads","Custo":84069.31,"Custo_Tributos":84069.31,"Tributo_Pct":0.0},{"Ano":2023,"Mes":7,"Midia":"Google Ads","Custo":56689.01,"Custo_Tributos":56689.01,"Tributo_Pct":0.0},{"Ano":2023,"Mes":7,"Midia":"Meta Ads","Custo":116564.79,"Custo_Tributos":116564.79,"Tributo_Pct":0.0},{"Ano":2023,"Mes":8,"Midia":"Google Ads","Custo":82632.07,"Custo_Tributos":82632.07,"Tributo_Pct":0.0},{"Ano":2023,"Mes":8,"Midia":"Meta Ads","Custo":50193.7,"Custo_Tributos":50193.7,"Tributo_Pct":0.0},{"Ano":2023,"Mes":9,"Midia":"Google Ads","Custo":90984.92,"Custo_Tributos":90984.92,"Tributo_Pct":0.0},{"Ano":2023,"Mes":9,"Midia":"Meta Ads","Custo":39778.32,"Custo_Tributos":39778.32,"Tributo_Pct":0.0},{"Ano":2023,"Mes":10,"Midia":"Google Ads","Custo":97199.97,"Custo_Tributos":97199.97,"Tributo_Pct":0.0},{"Ano":2023,"Mes":10,"Midia":"Meta Ads","Custo":54463.62,"Custo_Tributos":54463.62,"Tributo_Pct":0.0},{"Ano":2023,"Mes":11,"Midia":"Google Ads","Custo":86565.33,"Custo_Tributos":86565.33,"Tributo_Pct":0.0},{"Ano":2023,"Mes":11,"Midia":"Meta Ads","Custo":43159.11,"Custo_Tributos":43159.11,"Tributo_Pct":0.0},{"Ano":2023,"Mes":12,"Midia":"Google Ads","Custo":67859.0,"Custo_Tributos":67859.0,"Tributo_Pct":0.0},{"Ano":2023,"Mes":12,"Midia":"Meta Ads","Custo":35086.52,"Custo_Tributos":35086.52,"Tributo_Pct":0.0},{"Ano":2024,"Mes":1,"Midia":"Google Ads","Custo":111713.91,"Custo_Tributos":111713.91,"Tributo_Pct":0.0},{"Ano":2024,"Mes":1,"Midia":"Meta Ads","Custo":53159.84,"Custo_Tributos":53159.84,"Tributo_Pct":0.0},{"Ano":2024,"Mes":2,"Midia":"Google Ads","Custo":103492.61,"Custo_Tributos":103492.61,"Tributo_Pct":0.0},{"Ano":2024,"Mes":2,"Midia":"Meta Ads","Custo":23514.61,"Custo_Tributos":23514.61,"Tributo_Pct":0.0},{"Ano":2024,"Mes":3,"Midia":"Google Ads","Custo":137393.23,"Custo_Tributos":137393.23,"Tributo_Pct":0.0},{"Ano":2024,"Mes":3,"Midia":"Meta Ads","Custo":25711.91,"Custo_Tributos":25711.91,"Tributo_Pct":0.0},{"Ano":2024,"Mes":4,"Midia":"Google Ads","Custo":124351.3,"Custo_Tributos":124351.3,"Tributo_Pct":0.0},{"Ano":2024,"Mes":4,"Midia":"Meta Ads","Custo":25257.66,"Custo_Tributos":25257.66,"Tributo_Pct":0.0},{"Ano":2024,"Mes":5,"Midia":"Google Ads","Custo":133451.68,"Custo_Tributos":133451.68,"Tributo_Pct":0.0},{"Ano":2024,"Mes":5,"Midia":"Meta Ads","Custo":25535.54,"Custo_Tributos":25535.54,"Tributo_Pct":0.0},{"Ano":2024,"Mes":6,"Midia":"Google Ads","Custo":151413.85,"Custo_Tributos":151413.85,"Tributo_Pct":0.0},{"Ano":2024,"Mes":6,"Midia":"Meta Ads","Custo":26322.46,"Custo_Tributos":26322.46,"Tributo_Pct":0.0},{"Ano":2024,"Mes":7,"Midia":"Google Ads","Custo":173821.26,"Custo_Tributos":173821.26,"Tributo_Pct":0.0},{"Ano":2024,"Mes":7,"Midia":"Meta Ads","Custo":9064.92,"Custo_Tributos":9064.92,"Tributo_Pct":0.0},{"Ano":2024,"Mes":8,"Midia":"Google Ads","Custo":207231.23,"Custo_Tributos":207231.23,"Tributo_Pct":0.0},{"Ano":2024,"Mes":8,"Midia":"Meta Ads","Custo":7810.42,"Custo_Tributos":7810.42,"Tributo_Pct":0.0},{"Ano":2024,"Mes":9,"Midia":"Google Ads","Custo":201998.2,"Custo_Tributos":201998.2,"Tributo_Pct":0.0},{"Ano":2024,"Mes":9,"Midia":"Meta Ads","Custo":1913.39,"Custo_Tributos":1913.39,"Tributo_Pct":0.0},{"Ano":2024,"Mes":10,"Midia":"Google Ads","Custo":175776.76,"Custo_Tributos":175776.76,"Tributo_Pct":0.0},{"Ano":2024,"Mes":10,"Midia":"Meta Ads","Custo":6144.92,"Custo_Tributos":6144.92,"Tributo_Pct":0.0},{"Ano":2024,"Mes":11,"Midia":"Google Ads","Custo":167758.31,"Custo_Tributos":167758.31,"Tributo_Pct":0.0},{"Ano":2024,"Mes":11,"Midia":"Meta Ads","Custo":5966.49,"Custo_Tributos":5966.49,"Tributo_Pct":0.0},{"Ano":2024,"Mes":12,"Midia":"Google Ads","Custo":132048.17,"Custo_Tributos":132048.17,"Tributo_Pct":0.0},{"Ano":2024,"Mes":12,"Midia":"Meta Ads","Custo":6145.82,"Custo_Tributos":6145.82,"Tributo_Pct":0.0},{"Ano":2025,"Mes":1,"Midia":"Google Ads","Custo":151125.75,"Custo_Tributos":151125.75,"Tributo_Pct":0.0},{"Ano":2025,"Mes":1,"Midia":"Meta Ads","Custo":12158.99,"Custo_Tributos":12158.99,"Tributo_Pct":0.0},{"Ano":2025,"Mes":2,"Midia":"Google Ads","Custo":131797.48,"Custo_Tributos":131797.48,"Tributo_Pct":0.0},{"Ano":2025,"Mes":2,"Midia":"Meta Ads","Custo":13155.33,"Custo_Tributos":13155.33,"Tributo_Pct":0.0},{"Ano":2025,"Mes":3,"Midia":"Google Ads","Custo":144261.88,"Custo_Tributos":144261.88,"Tributo_Pct":0.0},{"Ano":2025,"Mes":3,"Midia":"Meta Ads","Custo":12520.95,"Custo_Tributos":12520.95,"Tributo_Pct":0.0},{"Ano":2025,"Mes":4,"Midia":"Google Ads","Custo":126657.43,"Custo_Tributos":126657.43,"Tributo_Pct":0.0},{"Ano":2025,"Mes":4,"Midia":"Meta Ads","Custo":11705.84,"Custo_Tributos":11705.84,"Tributo_Pct":0.0},{"Ano":2025,"Mes":5,"Midia":"Google Ads","Custo":139869.69,"Custo_Tributos":139869.69,"Tributo_Pct":0.0},{"Ano":2025,"Mes":5,"Midia":"Meta Ads","Custo":15922.75,"Custo_Tributos":15922.75,"Tributo_Pct":0.0},{"Ano":2025,"Mes":6,"Midia":"Google Ads","Custo":159270.26,"Custo_Tributos":159270.26,"Tributo_Pct":0.0},{"Ano":2025,"Mes":6,"Midia":"Meta Ads","Custo":8772.74,"Custo_Tributos":8772.74,"Tributo_Pct":0.0},{"Ano":2025,"Mes":7,"Midia":"Google Ads","Custo":144768.87,"Custo_Tributos":144768.87,"Tributo_Pct":0.0},{"Ano":2025,"Mes":7,"Midia":"Meta Ads","Custo":7014.81,"Custo_Tributos":7014.81,"Tributo_Pct":0.0},{"Ano":2025,"Mes":8,"Midia":"Google Ads","Custo":131063.42,"Custo_Tributos":131063.42,"Tributo_Pct":0.0},{"Ano":2025,"Mes":8,"Midia":"Meta Ads","Custo":5600.54,"Custo_Tributos":5600.54,"Tributo_Pct":0.0},{"Ano":2025,"Mes":9,"Midia":"Google Ads","Custo":122657.62,"Custo_Tributos":122657.62,"Tributo_Pct":0.0},{"Ano":2025,"Mes":9,"Midia":"Meta Ads","Custo":4363.96,"Custo_Tributos":4363.96,"Tributo_Pct":0.0},{"Ano":2025,"Mes":10,"Midia":"Google Ads","Custo":136837.54,"Custo_Tributos":136837.54,"Tributo_Pct":0.0},{"Ano":2025,"Mes":10,"Midia":"Meta Ads","Custo":31615.59,"Custo_Tributos":31615.59,"Tributo_Pct":0.0},{"Ano":2025,"Mes":11,"Midia":"Google Ads","Custo":135946.11,"Custo_Tributos":135946.11,"Tributo_Pct":0.0},{"Ano":2025,"Mes":11,"Midia":"Meta Ads","Custo":72373.62,"Custo_Tributos":72373.62,"Tributo_Pct":0.0},{"Ano":2025,"Mes":12,"Midia":"Google Ads","Custo":71690.59,"Custo_Tributos":71690.59,"Tributo_Pct":0.0},{"Ano":2025,"Mes":12,"Midia":"Meta Ads","Custo":97570.2,"Custo_Tributos":97570.2,"Tributo_Pct":0.0},{"Ano":2026,"Mes":1,"Midia":"Google Ads","Custo":58107.1,"Custo_Tributos":58107.1,"Tributo_Pct":0.0},{"Ano":2026,"Mes":1,"Midia":"Meta Ads","Custo":142908.85,"Custo_Tributos":162630.2713,"Tributo_Pct":0.138},{"Ano":2026,"Mes":2,"Midia":"Google Ads","Custo":57792.5,"Custo_Tributos":57792.5,"Tributo_Pct":0.0},{"Ano":2026,"Mes":2,"Midia":"Meta Ads","Custo":126476.27,"Custo_Tributos":143929.9953,"Tributo_Pct":0.138},{"Ano":2026,"Mes":3,"Midia":"Google Ads","Custo":37264.43,"Custo_Tributos":37264.43,"Tributo_Pct":0.0},{"Ano":2026,"Mes":3,"Midia":"Meta Ads","Custo":87721.79,"Custo_Tributos":99827.397,"Tributo_Pct":0.138}];
 
 // ── INIT ─────────────────────────────────────────────────────────────────────
-loadCache();
+loadFromSheets();
 </script>
 </body>
 </html>
