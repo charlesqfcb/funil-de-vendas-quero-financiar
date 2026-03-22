@@ -2603,24 +2603,56 @@ async function getZohoToken() {
     return ZOHO_CONFIG.accessToken;
   }
   if (!ZOHO_CONFIG.refreshToken) return null;
-  try {
-    var r = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: new URLSearchParams({
-        grant_type:    'refresh_token',
-        refresh_token: ZOHO_CONFIG.refreshToken,
-        client_id:     ZOHO_CONFIG.clientId,
-        client_secret: ZOHO_CONFIG.clientSecret
-      })
-    });
-    var d = await r.json();
-    if (d.access_token) {
-      ZOHO_CONFIG.accessToken = d.access_token;
-      ZOHO_CONFIG.tokenExpiry = now + (d.expires_in||3600)*1000;
-      return d.access_token;
-    }
-  } catch(e) {}
+
+  // Usar proxy CORS pois Zoho bloqueia chamadas diretas do browser
+  var params = new URLSearchParams({
+    grant_type:    'refresh_token',
+    refresh_token: ZOHO_CONFIG.refreshToken,
+    client_id:     ZOHO_CONFIG.clientId,
+    client_secret: ZOHO_CONFIG.clientSecret
+  }).toString();
+
+  // Tentar direto primeiro (pode funcionar em alguns ambientes)
+  var endpoints = [
+    {url: 'https://accounts.zoho.com/oauth/v2/token', direct: true},
+    {url: 'https://corsproxy.io/?url=https://accounts.zoho.com/oauth/v2/token', direct: false},
+    {url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://accounts.zoho.com/oauth/v2/token'), direct: false},
+  ];
+
+  for (var i=0; i<endpoints.length; i++) {
+    try {
+      var ep = endpoints[i];
+      var opts = {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: params
+      };
+      if (!ep.direct) {
+        // allorigins usa GET com URL encoded
+        if (ep.url.includes('allorigins')) {
+          opts.method = 'GET';
+          delete opts.body;
+          ep.url = 'https://api.allorigins.win/get?url=' + encodeURIComponent(
+            'https://accounts.zoho.com/oauth/v2/token?' + params
+          );
+        }
+      }
+      var r = await fetch(ep.url, opts);
+      var text = await r.text();
+      var d;
+      try {
+        // allorigins encapsula em {contents: "..."}
+        var wrapper = JSON.parse(text);
+        d = wrapper.contents ? JSON.parse(wrapper.contents) : wrapper;
+      } catch(e2) { d = JSON.parse(text); }
+
+      if (d && d.access_token) {
+        ZOHO_CONFIG.accessToken = d.access_token;
+        ZOHO_CONFIG.tokenExpiry = now + (d.expires_in||3600)*1000;
+        return d.access_token;
+      }
+    } catch(e) { continue; }
+  }
   return null;
 }
 
@@ -2648,12 +2680,25 @@ async function loadBVData() {
       + ZOHO_CONFIG.workspaceId + '/views/' + ZOHO_CONFIG.viewId
       + '/data?responseFormat=json&exportType=jsonCollection';
 
-    var r = await fetch(url, {
-      headers: {
-        'Authorization': 'Zoho-oauthtoken ' + token,
-        'ZANALYTICS-ORGID': ZOHO_CONFIG.orgId
-      }
-    });
+    // Fetch direto — Analytics API geralmente permite CORS com token
+    var r;
+    try {
+      r = await fetch(url, {
+        headers: {
+          'Authorization': 'Zoho-oauthtoken ' + token,
+          'ZANALYTICS-ORGID': ZOHO_CONFIG.orgId
+        }
+      });
+    } catch(e) {
+      // Fallback: usar proxy para o Analytics também
+      var proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(url);
+      r = await fetch(proxyUrl, {
+        headers: {
+          'Authorization': 'Zoho-oauthtoken ' + token,
+          'ZANALYTICS-ORGID': ZOHO_CONFIG.orgId
+        }
+      });
+    }
     var text = await r.text();
     BV_DATA = parseBVCSV(text);
 
